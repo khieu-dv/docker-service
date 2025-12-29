@@ -87,6 +87,267 @@ function rpcGetWaitingMatch(
 }
 
 // ============================================================================
+// RPC: Create or Get Support Conversation
+// ============================================================================
+
+interface CreateSupportConversationRequest {
+  userId: string;
+  userName: string;
+  userEmail?: string;
+}
+
+interface CreateSupportConversationResponse {
+  channelId: string;
+  exists: boolean;
+}
+
+interface Conversation {
+  conversationId: string;
+  userId: string;
+  userName: string;
+  userEmail?: string;
+  status: 'active' | 'resolved' | 'pending';
+  createdAt: number;
+  updatedAt: number;
+  lastMessageAt: number;
+  unreadCount: {
+    user: number;
+    admin: number;
+  };
+  metadata?: { [key: string]: any };
+}
+
+function rpcCreateSupportConversation(
+  ctx: nkruntime.Context,
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  payload: string
+): string {
+  logger.info('📞 RPC called: create_support_conversation');
+  logger.info(`Raw payload: ${payload}`);
+
+  try {
+    const request: CreateSupportConversationRequest = JSON.parse(payload);
+    logger.info(`Parsed request: ${JSON.stringify(request)}`);
+    const { userId, userName, userEmail } = request;
+    logger.info(`userId: ${userId}, userName: ${userName}, userEmail: ${userEmail}`);
+
+    // Validate required fields
+    if (!userId || userId === 'undefined' || userId === 'null') {
+      logger.error(`❌ Invalid userId: ${userId}`);
+      throw new Error('userId is required and must be a valid value');
+    }
+
+    if (!userName || userName.trim() === '') {
+      logger.error(`❌ Invalid userName: ${userName}`);
+      throw new Error('userName is required and must not be empty');
+    }
+
+    const channelId = `support_chat_${userId}`;
+    logger.info(`Creating/getting support channel: ${channelId}`);
+
+    // Check if conversation already exists
+    // @ts-expect-error - storageRead exists in Nakama runtime but not in type definitions
+    const objects = nk.storageRead([
+      {
+        collection: 'conversations',
+        key: channelId,
+        userId: ctx.userId, // Use current Nakama user ID
+      },
+    ]);
+
+    if (objects.length > 0) {
+      logger.info(`✅ Conversation exists: ${channelId}`);
+      const response: CreateSupportConversationResponse = {
+        channelId: channelId,
+        exists: true,
+      };
+      return JSON.stringify(response);
+    }
+
+    // Create new conversation
+    const conversation: Conversation = {
+      conversationId: channelId,
+      userId: userId,
+      userName: userName,
+      userEmail: userEmail,
+      status: 'active',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      lastMessageAt: Date.now(),
+      unreadCount: {
+        user: 0,
+        admin: 0,
+      },
+      metadata: {},
+    };
+
+    // @ts-expect-error - storageWrite exists in Nakama runtime but not in type definitions
+    nk.storageWrite([
+      {
+        collection: 'conversations',
+        key: channelId,
+        userId: ctx.userId, // Use current Nakama user ID
+        value: conversation,
+        permissionRead: 2, // Public read
+        permissionWrite: 0, // No client writes
+      },
+    ]);
+
+    logger.info(`✅ Created new conversation: ${channelId}`);
+
+    const response: CreateSupportConversationResponse = {
+      channelId: channelId,
+      exists: false,
+    };
+
+    return JSON.stringify(response);
+  } catch (error) {
+    logger.error(`❌ Error in create_support_conversation: ${error}`);
+    throw error;
+  }
+}
+
+// ============================================================================
+// RPC: List All Conversations (Admin Only)
+// ============================================================================
+
+interface ListConversationsResponse {
+  conversations: Conversation[];
+  cursor?: string;
+}
+
+function rpcListConversations(
+  ctx: nkruntime.Context,
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  payload: string
+): string {
+  logger.info('📞 RPC called: list_conversations');
+
+  try {
+    // TODO: Add admin permission check when auth is integrated
+    // For now, allow any authenticated user to list conversations
+
+    // List all conversations from storage
+    // @ts-expect-error - storageList exists in Nakama runtime but not in type definitions
+    const result = nk.storageList(
+      null, // userId (null for server to see all)
+      'conversations',
+      100, // limit
+      '' // cursor (pagination)
+    );
+
+    // Filter out conversations with invalid userId
+    const conversations: Conversation[] = result.objects
+      .map((obj) => obj.value as Conversation)
+      .filter((conv) => {
+        const isValid = conv.userId && conv.userId !== 'undefined' && conv.userId !== 'null';
+        if (!isValid) {
+          logger.warn(`⚠️ Skipping conversation with invalid userId: ${conv.conversationId}`);
+        }
+        return isValid;
+      });
+
+    logger.info(`✅ Found ${conversations.length} valid conversations`);
+
+    const response: ListConversationsResponse = {
+      conversations: conversations,
+      cursor: result.cursor,
+    };
+
+    return JSON.stringify(response);
+  } catch (error) {
+    logger.error(`❌ Error in list_conversations: ${error}`);
+    throw error;
+  }
+}
+
+// ============================================================================
+// RPC: Mark Messages as Read
+// ============================================================================
+
+interface MarkMessagesReadRequest {
+  channelId: string;
+  role: 'user' | 'admin';
+}
+
+interface MarkMessagesReadResponse {
+  success: boolean;
+}
+
+function rpcMarkMessagesRead(
+  ctx: nkruntime.Context,
+  logger: nkruntime.Logger,
+  nk: nkruntime.Nakama,
+  payload: string
+): string {
+  logger.info('📞 RPC called: mark_messages_read');
+
+  try {
+    const request: MarkMessagesReadRequest = JSON.parse(payload);
+    const { channelId, role } = request;
+
+    // Extract room name from channel ID
+    // Channel ID format: "2...support_chat_1" -> room name: "support_chat_1"
+    const roomName = channelId.includes('...')
+      ? channelId.split('...')[1]
+      : channelId;
+
+    logger.info(`Extracting room name from channelId: ${channelId} -> ${roomName}`);
+
+    // Read current conversation using room name as key
+    // @ts-expect-error - storageRead exists in Nakama runtime but not in type definitions
+    const objects = nk.storageRead([
+      {
+        collection: 'conversations',
+        key: roomName,
+        userId: ctx.userId, // Use current Nakama user ID
+      },
+    ]);
+
+    if (objects.length === 0) {
+      throw new Error(`Conversation not found: ${channelId}`);
+    }
+
+    const conversation = objects[0].value as Conversation;
+
+    // Update unread count based on role
+    if (role === 'admin') {
+      conversation.unreadCount.admin = 0;
+    } else {
+      conversation.unreadCount.user = 0;
+    }
+
+    conversation.updatedAt = Date.now();
+
+    // Write updated conversation back to storage
+    // @ts-expect-error - storageWrite exists in Nakama runtime but not in type definitions
+    nk.storageWrite([
+      {
+        collection: 'conversations',
+        key: roomName,
+        userId: ctx.userId, // Use current Nakama user ID
+        value: conversation,
+        permissionRead: 2,
+        permissionWrite: 0,
+      },
+    ]);
+
+    logger.info(`✅ Marked messages as read for ${role} in ${roomName}`);
+
+    const response: MarkMessagesReadResponse = {
+      success: true,
+    };
+
+    return JSON.stringify(response);
+  } catch (error) {
+    logger.error(`❌ Error in mark_messages_read: ${error}`);
+    throw error;
+  }
+}
+
+// ============================================================================
 // Match Handler Functions
 // ============================================================================
 
@@ -340,6 +601,16 @@ function InitModule(
   // Register RPC: Get or create waiting match (global room pattern)
   initializer.registerRpc('get_waiting_match', rpcGetWaitingMatch);
   logger.info('✅ Registered RPC: get_waiting_match');
+
+  // Register RPC: Support Chat functions
+  initializer.registerRpc('create_support_conversation', rpcCreateSupportConversation);
+  logger.info('✅ Registered RPC: create_support_conversation');
+
+  initializer.registerRpc('list_conversations', rpcListConversations);
+  logger.info('✅ Registered RPC: list_conversations');
+
+  initializer.registerRpc('mark_messages_read', rpcMarkMessagesRead);
+  logger.info('✅ Registered RPC: mark_messages_read');
 
   // Register Match Handler
   initializer.registerMatch('eco_conscience_match', {
